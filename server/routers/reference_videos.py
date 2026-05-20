@@ -6,7 +6,7 @@ Mount prefix: /api/v1/projects/{project_name}/reference-videos
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -17,7 +17,7 @@ from lib.app_data_dir import app_data_dir
 from lib.asset_types import BUCKET_KEY
 from lib.generation_queue import get_generation_queue
 from lib.i18n import Translator
-from lib.project_manager import ProjectManager, effective_mode
+from lib.project_manager import EpisodeScriptReboundError, ProjectManager, effective_mode
 from lib.reference_video import parse_prompt
 from server.auth import CurrentUser
 
@@ -74,38 +74,47 @@ def _load_episode_script(project_name: str, episode: int, _t: Translator) -> tup
     return project, script, script_file
 
 
-def _resolve_episode(project_name: str, episode: int, _t: Translator) -> tuple[dict, str]:
-    """加载 project.json，解析并校验指定集的 script_file（不预读 script）。
+def _episode_script_resolver(episode: int, _t: Translator, refs: list[dict] | None = None) -> Callable[[dict], str]:
+    """构造一个解析器：从 project.json 解析并校验指定集，返回其 script_file。
 
-    返回 (project, script_file)。写端点据此进入 `locked_script` 在锁内 fresh-load 剧本，
-    避免在锁外读取的快照与并发写者互相覆盖。
+    解析器在 `locked_episode_script` 的项目锁内被调用（候选解析 + 持锁复核各一次），
+    把「找 episode + reference_video 模式校验 + 可选 references 存在性校验」收进同一临界区，
+    避免锁外快照与并发写者不一致。
     """
-    try:
-        project = get_project_manager().load_project(project_name)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=_t("project_not_found", name=project_name)) from exc
-    episodes = project.get("episodes") or []
-    meta = next((e for e in episodes if e.get("episode") == episode), None)
-    if meta is None or not meta.get("script_file"):
-        raise HTTPException(status_code=404, detail=_t("ref_episode_not_found", episode=episode))
-    if effective_mode(project=project, episode=meta) != "reference_video":
-        raise HTTPException(status_code=409, detail=_t("ref_not_reference_video_mode"))
-    return project, meta["script_file"]
+
+    def _resolve(project: dict) -> str:
+        episodes = project.get("episodes") or []
+        meta = next((e for e in episodes if e.get("episode") == episode), None)
+        if meta is None or not meta.get("script_file"):
+            raise HTTPException(status_code=404, detail=_t("ref_episode_not_found", episode=episode))
+        if effective_mode(project=project, episode=meta) != "reference_video":
+            raise HTTPException(status_code=409, detail=_t("ref_not_reference_video_mode"))
+        if refs is not None:
+            _validate_references_exist(project, refs, _t)
+        return meta["script_file"]
+
+    return _resolve
 
 
 @contextmanager
-def _locked_episode_script(project_name: str, script_file: str, _t: Translator) -> Iterator[dict]:
-    """进入 locked_script，并把缺失脚本文件的 FileNotFoundError 归一为 404。
+def _locked_episode_script(project_name: str, resolver: Callable[[dict], str], _t: Translator) -> Iterator[dict]:
+    """进入 `locked_episode_script`，把缺失文件归一为 404、并发改绑归一为 409。
 
-    project.json 可能残留指向已删除/移动文件的 script_file；此时 locked_script 内的
-    load_script 会抛 FileNotFoundError，需转成 404 而非 500（对齐旧 _load_episode_script
-    的行为，后者会先 load_script 把缺失文件转成 404）。
+    project.json 可能残留指向已删除/移动文件的 script_file；此时锁内 load_script 抛
+    FileNotFoundError，需转成 404 而非 500。加锁前后 episode→script_file 绑定被并发 PATCH
+    改动时抛 EpisodeScriptReboundError，转成 409（前端可重试，不外泄内部绑定细节）。
     """
     try:
-        with get_project_manager().locked_script(project_name, script_file) as script:
+        with get_project_manager().locked_episode_script(project_name, resolver) as script:
             yield script
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=_t("script_not_found", name=script_file)) from exc
+        # 区分「项目缺失」与「project.json 指向的脚本文件缺失（stale 绑定）」
+        if not get_project_manager().project_exists(project_name):
+            raise HTTPException(status_code=404, detail=_t("project_not_found", name=project_name)) from exc
+        raise HTTPException(status_code=404, detail=_t("ref_script_missing")) from exc
+    except EpisodeScriptReboundError as exc:
+        logger.info("episode script rebound during write: %s", exc)
+        raise HTTPException(status_code=409, detail=_t("ref_script_rebound")) from exc
 
 
 def _validate_references_exist(project: dict, refs: list[dict], _t: Translator) -> None:
@@ -177,12 +186,9 @@ async def add_unit(
     _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
-    project, script_file = _resolve_episode(project_name, episode, _t)
-
     refs = [r.model_dump() for r in req.references]
-    _validate_references_exist(project, refs, _t)
 
-    with _locked_episode_script(project_name, script_file, _t) as script:
+    with _locked_episode_script(project_name, _episode_script_resolver(episode, _t, refs), _t) as script:
         # unit_id 在锁内基于 fresh script 计算，避免并发新增撞 ID
         unit = _build_unit_dict(
             unit_id=_next_unit_id(script, episode),
@@ -223,15 +229,10 @@ async def patch_unit(
     _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
-    project, script_file = _resolve_episode(project_name, episode, _t)
+    # references 存在性校验在解析器内、项目锁内进行，失败 raise 400
+    refs: list[dict] | None = [r.model_dump() for r in req.references] if req.references is not None else None
 
-    # references 存在性校验对 project（只读）先做，失败 raise 400（在进锁前）
-    refs: list[dict] | None = None
-    if req.references is not None:
-        refs = [r.model_dump() for r in req.references]
-        _validate_references_exist(project, refs, _t)
-
-    with _locked_episode_script(project_name, script_file, _t) as script:
+    with _locked_episode_script(project_name, _episode_script_resolver(episode, _t, refs), _t) as script:
         unit = _find_unit(script, unit_id, _t)  # 未找到 raise 404 → 跳过写回
 
         if refs is not None:
@@ -265,8 +266,7 @@ async def delete_unit(
     _user: CurrentUser,
     _t: Translator,
 ) -> Response:
-    _project, script_file = _resolve_episode(project_name, episode, _t)
-    with _locked_episode_script(project_name, script_file, _t) as script:
+    with _locked_episode_script(project_name, _episode_script_resolver(episode, _t), _t) as script:
         units = script.get("video_units") or []
         new_units = [u for u in units if u.get("unit_id") != unit_id]
         if len(new_units) == len(units):
@@ -288,8 +288,7 @@ async def reorder_units(
     _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
-    _project, script_file = _resolve_episode(project_name, episode, _t)
-    with _locked_episode_script(project_name, script_file, _t) as script:
+    with _locked_episode_script(project_name, _episode_script_resolver(episode, _t), _t) as script:
         units = script.get("video_units") or []
         existing_ids = [u.get("unit_id") for u in units]
 

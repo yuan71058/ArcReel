@@ -132,6 +132,8 @@ MESSAGES = {
     "ref_unit_ids_length_mismatch": "unit_ids 数量与现有单元不一致",
     "ref_duplicate_unit_ids": "unit_ids 存在重复",
     "ref_unit_ids_mismatch": "unit_ids 与现有单元不匹配",
+    "ref_script_missing": "该集绑定的剧本文件不存在",
+    "ref_script_rebound": "该集剧本绑定已变更，请重试",
     "about_update_check_failed": "检查更新失败，请稍后重试",
     "about_version_read_failed": "读取应用版本失败",
     # Image Capability
